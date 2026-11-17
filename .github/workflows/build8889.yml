@@ -1,0 +1,213 @@
+name: Kernel Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Defconfig yang dipakai'
+        required: false
+        default: 'whyred_defconfig'
+      artifact_scope:
+        description: 'File yang diupload sebagai artifact'
+        required: false
+        default: 'ringkas'
+        type: choice
+        options:
+          - ringkas
+          - lengkap
+
+env:
+  KERNEL_DIR: ${{ github.workspace }}/kernel
+  TC_DIR: ${{ github.workspace }}/toolchain/proton-clang
+  OUT_DIR: ${{ github.workspace }}/kernel/out
+  TC_REPO: https://github.com/kdrag0n/proton-clang
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v6
+        with:
+          path: kernel
+          submodules: true
+
+      - name: Cek sisa disk
+        run: df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev \
+            build-essential zip curl git python3 \
+            python-is-python3 ccache
+
+      - name: Cache Proton Clang toolchain
+        id: cache-toolchain
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.TC_DIR }}
+          key: proton-clang-v1
+
+      - name: Download Proton Clang toolchain
+        if: steps.cache-toolchain.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$(dirname "$TC_DIR")"
+          git clone --depth=1 "$TC_REPO" "$TC_DIR"
+          rm -rf "$TC_DIR/.git"
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.event.inputs.defconfig || 'whyred_defconfig' }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ github.event.inputs.defconfig || 'whyred_defconfig' }}-
+
+      - name: Setup ccache
+        run: |
+          export CCACHE_DIR=~/.ccache
+          ccache -M 5G
+          ccache -z
+
+      - name: Setup toolchain PATH
+        run: echo "$TC_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain info
+        run: |
+          which clang
+          clang --version
+
+      - name: Siapkan nama artifact
+        id: meta
+        if: always()
+        run: |
+          BRANCH_NAME="${{ github.ref_name }}"
+          BRANCH_SAFE="${BRANCH_NAME//\//-}"
+          TANGGAL=$(date +'%d%m%Y')
+          echo "artifact_name=kernel-4.4-${BRANCH_SAFE}-${{ github.run_number }}-${TANGGAL}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup KernelSU
+        run: |
+          DEFCONFIG="${{ github.event.inputs.defconfig || 'whyred_defconfig' }}"
+          CONFIG_FILE="$KERNEL_DIR/arch/arm64/configs/$DEFCONFIG"
+
+          test -f "$KERNEL_DIR/KernelSU/kernel/Kconfig"
+          test -f "$KERNEL_DIR/drivers/kernelsu/Kconfig"
+          test -f "$CONFIG_FILE"
+
+          grep -q '^CONFIG_KSU=y' "$CONFIG_FILE" || echo "CONFIG_KSU=y" >> "$CONFIG_FILE"
+
+      - name: Build kernel
+        id: build
+        run: |
+          START_TIME=$(date +%s)
+
+          cd "$KERNEL_DIR"
+          mkdir -p "$OUT_DIR"
+
+          DEFCONFIG="${{ github.event.inputs.defconfig || 'whyred_defconfig' }}"
+
+          CUSTOM_CFLAGS="-march=armv8-a -mno-outline"
+          CUSTOM_HOSTCFLAGS="-Wall -Wmissing-prototypes -Wstrict-prototypes -O2 -fomit-frame-pointer -std=gnu89 -fcommon"
+
+          TOOLCHAIN_ARGS=(
+            ARCH=arm64
+            CC="ccache clang"
+            HOSTCC="ccache clang"
+            HOSTCXX="ccache clang++"
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            READELF=llvm-readelf
+            KBUILD_BUILD_USER=rexsfx
+            KBUILD_BUILD_HOST=localhost
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            KCFLAGS="$CUSTOM_CFLAGS"
+            HOSTCFLAGS="$CUSTOM_HOSTCFLAGS"
+          )
+
+          if [ -n "${KBUILD_BUILD_TIMESTAMP:-}" ]; then
+            TOOLCHAIN_ARGS+=(KBUILD_BUILD_TIMESTAMP="$KBUILD_BUILD_TIMESTAMP")
+          fi
+
+          echo "=== Defconfig: $DEFCONFIG ==="
+
+          LOG_FILE="${{ github.workspace }}/build.log"
+
+          make O="$OUT_DIR" "${TOOLCHAIN_ARGS[@]}" "$DEFCONFIG" 2>&1 | tee "$LOG_FILE"
+          make -j"$(nproc --all)" O="$OUT_DIR" "${TOOLCHAIN_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+          BUILD_EXIT=${PIPESTATUS[0]}
+
+          ccache -s | tee -a "$LOG_FILE"
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          MIN=$((DURATION / 60))
+          SEC=$((DURATION % 60))
+
+          echo "-----------------------------------------------------"
+          echo "Waktu total kompilasi: ${MIN} menit ${SEC} detik"
+          echo "-----------------------------------------------------"
+
+          echo "duration_min=${MIN}" >> "$GITHUB_OUTPUT"
+          echo "duration_sec=${SEC}" >> "$GITHUB_OUTPUT"
+          echo "defconfig=${DEFCONFIG}" >> "$GITHUB_OUTPUT"
+
+          exit "$BUILD_EXIT"
+
+      - name: Verify build output
+        run: |
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ] || [ -f "$OUT_DIR/arch/arm64/boot/Image.gz" ]; then
+            echo "BUILD BERHASIL"
+          else
+            echo "BUILD GAGAL - file Image.gz tidak ditemukan"
+            exit 1
+          fi
+
+      - name: Upload kernel image (ringkas - folder boot)
+        if: ${{ (github.event.inputs.artifact_scope || 'ringkas') == 'ringkas' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}
+          path: ${{ env.OUT_DIR }}/arch/arm64/boot
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload kernel build (lengkap, seluruh folder out)
+        if: ${{ github.event.inputs.artifact_scope == 'lengkap' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}-out
+          path: ${{ env.OUT_DIR }}
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload log build
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.artifact_name }}-log
+          path: ${{ github.workspace }}/build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Build summary
+        if: always()
+        run: |
+          {
+            echo "## Ringkasan Build Kernel"
+            echo ""
+            echo "| Item | Nilai |"
+            echo "|---|---|"
+            echo "| Defconfig | \`${{ steps.build.outputs.defconfig }}\` |"
+            echo "| Waktu kompilasi | **${{ steps.build.outputs.duration_min }} menit ${{ steps.build.outputs.duration_sec }} detik** |"
+            echo "| Status | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
